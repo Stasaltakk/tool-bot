@@ -2,15 +2,24 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import json
 import os
+import time
+from flask import Flask
+import threading
 
-# ========== ТВОЙ ТОКЕН ОТ BOTFATHER ==========
-TOKEN = "8674283372:AAH4aPrXaetqLzzUnIQiJAue430HaJQ64Uc"  # ⚠️ ЗАМЕНИ НА РЕАЛЬНЫЙ ТОКЕН
+# ========== ПРОКСИ ЧЕРЕЗ CLOUDFLARE WORKER (ОПЦИОНАЛЬНО) ==========
+# Если не используешь прокси - закомментируй следующую строку
+# telebot.apihelper.API_URL = "https://tg-proxy.kkotleta464.workers.dev/bot{0}/{1}"
+
+# ========== ТОКЕН ==========
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    print("❌ Ошибка: BOT_TOKEN не найден!")
+    exit(1)
+
 bot = telebot.TeleBot(TOKEN)
 
 # ========== НАСТРОЙКИ ==========
-# Список администраторов (кто может добавлять, удалять, редактировать)
-# Как узнать свой Telegram ID: напиши боту @userinfobot
-ADMINS = [1610947558]  # ⚠️ ЗАМЕНИ НА СВОЙ TELEGRAM ID
+ADMINS = [1610947558]  # Твой Telegram ID
 
 # ========== ХРАНИЛИЩЕ ==========
 tools = {}
@@ -52,7 +61,6 @@ def tools_list_menu(action, message):
     markup.add(InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu"))
     return markup
 
-# ========== КОМАНДЫ ==========
 @bot.message_handler(commands=['старт', 'start'])
 def start(message):
     user_id = message.from_user.id
@@ -65,88 +73,8 @@ def start(message):
         reply_markup=main_menu()
     )
 
-@bot.message_handler(commands=['помощь', 'help'])
-def help_command(message):
-    bot.send_message(
-        message.chat.id,
-        "📖 Команды:\n/старт - Главное меню\n/добавить - Добавить (админ)\n/редактировать - Изменить (админ)\n/удалить - Удалить (админ)\n/передать - Передать\n/укого - Узнать владельца\n/список - Все инструменты\n/история - История\n/статистика - Статистика"
-    )
-
-@bot.message_handler(commands=['добавить', 'add'])
-def add_command(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔ Только администратор!")
-        return
-    msg = bot.send_message(message.chat.id, "🔧 Введи название инструмента:")
-    bot.register_next_step_handler(msg, add_tool)
-
-@bot.message_handler(commands=['редактировать', 'edit'])
-def edit_command(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔ Только администратор!")
-        return
-    if not tools:
-        bot.send_message(message.chat.id, "📭 Список пуст!")
-        return
-    markup = InlineKeyboardMarkup(row_width=1)
-    for tool_name in tools.keys():
-        markup.add(InlineKeyboardButton(f"🔧 {tool_name}", callback_data=f"edit_select_{tool_name}"))
-    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
-    bot.send_message(message.chat.id, "✏️ Выбери инструмент:", reply_markup=markup)
-
-@bot.message_handler(commands=['удалить', 'delete'])
-def delete_command(message):
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "⛔ Только администратор!")
-        return
-    if not tools:
-        bot.send_message(message.chat.id, "📭 Список пуст!")
-        return
-    markup = InlineKeyboardMarkup(row_width=1)
-    for tool_name in tools.keys():
-        markup.add(InlineKeyboardButton(f"🔧 {tool_name}", callback_data=f"delete_select_{tool_name}"))
-    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
-    bot.send_message(message.chat.id, "🗑️ Выбери инструмент для удаления:", reply_markup=markup)
-
-@bot.message_handler(commands=['передать', 'transfer'])
-def transfer_command(message):
-    if not tools:
-        bot.send_message(message.chat.id, "📭 Список пуст!")
-        return
-    markup = tools_list_menu("transfer", message)
-    if markup:
-        bot.send_message(message.chat.id, "🔧 Выбери инструмент:", reply_markup=markup)
-
-@bot.message_handler(commands=['укого', 'who'])
-def who_command(message):
-    if not tools:
-        bot.send_message(message.chat.id, "📭 Список пуст!")
-        return
-    markup = tools_list_menu("who", message)
-    if markup:
-        bot.send_message(message.chat.id, "🔧 Выбери инструмент:", reply_markup=markup)
-
-@bot.message_handler(commands=['список', 'list'])
-def list_command(message):
-    show_all_tools(message)
-
-@bot.message_handler(commands=['история', 'history'])
-def history_command(message):
-    if not tools:
-        bot.send_message(message.chat.id, "📭 Список пуст!")
-        return
-    markup = tools_list_menu("history", message)
-    if markup:
-        bot.send_message(message.chat.id, "🔧 Выбери инструмент:", reply_markup=markup)
-
-@bot.message_handler(commands=['статистика', 'stats'])
-def stats_command(message):
-    show_statistics(message)
-
-# ========== ОСНОВНОЙ ОБРАБОТЧИК КНОПОК ==========
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    # ДОБАВЛЕНИЕ
     if call.data == "add":
         if not is_admin(call.from_user.id):
             bot.answer_callback_query(call.id, "⛔ Только администратор!", show_alert=True)
@@ -155,7 +83,6 @@ def callback_handler(call):
         bot.register_next_step_handler(msg, add_tool)
         bot.answer_callback_query(call.id)
     
-    # РЕДАКТИРОВАНИЕ - выбор инструмента
     elif call.data == "edit":
         if not is_admin(call.from_user.id):
             bot.answer_callback_query(call.id, "⛔ Только администратор!", show_alert=True)
@@ -170,7 +97,6 @@ def callback_handler(call):
         bot.edit_message_text("✏️ Выбери инструмент для редактирования:", call.message.chat.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id)
     
-    # УДАЛЕНИЕ - выбор инструмента
     elif call.data == "delete":
         if not is_admin(call.from_user.id):
             bot.answer_callback_query(call.id, "⛔ Только администратор!", show_alert=True)
@@ -185,7 +111,6 @@ def callback_handler(call):
         bot.edit_message_text("🗑️ Выбери инструмент для удаления:", call.message.chat.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id)
     
-    # ПЕРЕДАЧА
     elif call.data == "transfer":
         if not tools:
             bot.answer_callback_query(call.id, "📭 Список пуст!", show_alert=True)
@@ -194,7 +119,6 @@ def callback_handler(call):
         bot.edit_message_text("🔧 Выбери инструмент для передачи:", call.message.chat.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id)
     
-    # У КОГО
     elif call.data == "who_has":
         if not tools:
             bot.answer_callback_query(call.id, "📭 Список пуст!", show_alert=True)
@@ -203,12 +127,10 @@ def callback_handler(call):
         bot.edit_message_text("🔧 Выбери инструмент:", call.message.chat.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id)
     
-    # СПИСОК
     elif call.data == "list":
         show_all_tools(call.message)
         bot.answer_callback_query(call.id)
     
-    # ИСТОРИЯ
     elif call.data == "history":
         if not tools:
             bot.answer_callback_query(call.id, "📭 Список пуст!", show_alert=True)
@@ -217,17 +139,14 @@ def callback_handler(call):
         bot.edit_message_text("🔧 Выбери инструмент для истории:", call.message.chat.id, call.message.message_id, reply_markup=markup)
         bot.answer_callback_query(call.id)
     
-    # СТАТИСТИКА
     elif call.data == "stats":
         show_statistics(call.message)
         bot.answer_callback_query(call.id)
     
-    # НАЗАД В МЕНЮ
     elif call.data == "back_to_menu":
         bot.edit_message_text("🔧 Главное меню:", call.message.chat.id, call.message.message_id, reply_markup=main_menu())
         bot.answer_callback_query(call.id)
     
-    # ВЫБОР ИНСТРУМЕНТА ДЛЯ ПЕРЕДАЧИ
     elif call.data.startswith("transfer_"):
         tool_name = call.data.replace("transfer_", "")
         if tool_name not in tools:
@@ -237,38 +156,32 @@ def callback_handler(call):
         msg = bot.send_message(call.message.chat.id, f"📝 Кому передаёшь '{tool_name}'? (Введи имя/ФИО)")
         bot.register_next_step_handler(msg, lambda m: complete_transfer(m, tool_name))
     
-    # ВЫБОР ИНСТРУМЕНТА ДЛЯ ПРОСМОТРА ВЛАДЕЛЬЦА
     elif call.data.startswith("who_"):
         tool_name = call.data.replace("who_", "")
         who_has_tool(call.message, tool_name)
         bot.answer_callback_query(call.id)
     
-    # ВЫБОР ИНСТРУМЕНТА ДЛЯ ИСТОРИИ
     elif call.data.startswith("history_"):
         tool_name = call.data.replace("history_", "")
         show_history(call.message, tool_name)
         bot.answer_callback_query(call.id)
     
-    # ВЫБОР ИНСТРУМЕНТА ДЛЯ РЕДАКТИРОВАНИЯ
     elif call.data.startswith("edit_select_"):
         tool_name = call.data.replace("edit_select_", "")
         bot.answer_callback_query(call.id)
         msg = bot.send_message(call.message.chat.id, f"✏️ Введи НОВОЕ название для '{tool_name}':")
         bot.register_next_step_handler(msg, lambda m: edit_tool(m, tool_name))
     
-    # ВЫБОР ИНСТРУМЕНТА ДЛЯ УДАЛЕНИЯ
     elif call.data.startswith("delete_select_"):
         tool_name = call.data.replace("delete_select_", "")
         confirm_delete(call.message, tool_name)
         bot.answer_callback_query(call.id)
     
-    # ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ
     elif call.data.startswith("confirm_delete_"):
         tool_name = call.data.replace("confirm_delete_", "")
         delete_tool(call.message, tool_name)
         bot.answer_callback_query(call.id)
 
-# ========== ФУНКЦИИ ==========
 def add_tool(message):
     tool_name = message.text.strip()
     if not tool_name:
@@ -391,12 +304,24 @@ def show_statistics(message):
         bot.send_message(message.chat.id, text, parse_mode="Markdown")
     bot.send_message(message.chat.id, "Выбери действие:", reply_markup=main_menu())
 
+# ========== FLASK ВЕБ-СЕРВЕР ДЛЯ RAILWAY ==========
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ Бот для учёта инструментов работает!"
+
+def run_bot():
+    print("🚀 Бот запущен и готов к работе!")
+    bot.infinity_polling()
+
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
-    print("=" * 40)
-    print("✅ Бот запущен и готов к работе!")
-    print(f"👤 Администраторы: {ADMINS}")
-    print(f"💾 Файл данных: {DATA_FILE}")
-    print("=" * 40)
-    print("Нажми Ctrl+C для остановки")
-    bot.infinity_polling()
+    # Запускаем бота в отдельном потоке
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    
+    # Запускаем Flask сервер для Railway
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🌐 Веб-сервер запущен на порту {port}")
+    app.run(host='0.0.0.0', port=port)
