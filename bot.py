@@ -19,7 +19,7 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 # ========== НАСТРОЙКИ ==========
-ADMINS = [1610947558]  # Твой Telegram ID
+ADMINS = [1610947558, 134827143]  # Твой Telegram ID
 
 # ========== ХРАНИЛИЩЕ ==========
 tools = {}
