@@ -23,7 +23,13 @@ ADMINS = [1610947558, 134827143]  # Твой Telegram ID
 
 # ========== ХРАНИЛИЩЕ ==========
 tools = {}
-DATA_FILE = "tools_data.json"
+# ========== ХРАНИЛИЩЕ ==========
+# Определяем папку для данных (используем Railway volume или локальную папку)
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data" if os.path.exists("/app/data") else ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, "tools_data.json")
+
+tools = {}
 
 def save_data():
     with open(DATA_FILE, "w", encoding="utf-8") as f:
