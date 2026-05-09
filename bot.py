@@ -1,6 +1,10 @@
 """
 Telegram-бот учёта инструментов.
-MVP по ТЗ: пользователи, категории, инструменты, передача с подтверждением, списание, история.
+Полностью переработанный UX:
+ - Действия редактируют сообщение, без дубликатов меню
+ - Команды /menu, /tools, /add, /users, /cancel, /help
+ - Кнопки 'Отмена' на всех шагах ввода
+ - Подтверждения опасных действий
 """
 import os
 import telebot
@@ -19,17 +23,32 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-# Telegram ID первого админа — ставится из переменной окружения,
-# чтобы при первом запуске админ мог войти и добавить остальных пользователей
 INITIAL_ADMIN_ID = os.environ.get("INITIAL_ADMIN_ID")
 if INITIAL_ADMIN_ID:
     INITIAL_ADMIN_ID = int(INITIAL_ADMIN_ID)
 
 
+# ========== СОСТОЯНИЕ ОЖИДАНИЯ ВВОДА ==========
+# Хранит для какого пользователя какое действие сейчас ожидается
+# {user_id: {"action": "add_category", "data": {...}, "msg_id": int}}
+pending_input = {}
+
+
+def set_pending(user_id: int, action: str, data: dict = None, msg_id: int = None):
+    pending_input[user_id] = {"action": action, "data": data or {}, "msg_id": msg_id}
+
+
+def clear_pending(user_id: int):
+    pending_input.pop(user_id, None)
+
+
+def get_pending(user_id: int):
+    return pending_input.get(user_id)
+
+
 # ========== УТИЛИТЫ ==========
 
 def ensure_initial_admin():
-    """При первом запуске создаёт начального админа из переменной окружения."""
     if not INITIAL_ADMIN_ID:
         return
     user = db.get_user_by_telegram_id(INITIAL_ADMIN_ID)
@@ -41,21 +60,37 @@ def ensure_initial_admin():
 
 
 def check_access(user_id: int) -> bool:
-    """Проверка доступа к боту. Только зарегистрированные пользователи."""
     return db.is_registered(user_id)
 
 
-def access_denied(chat_id):
-    bot.send_message(
-        chat_id,
-        "⛔ У вас нет доступа к этому боту.\n"
-        "Обратитесь к администратору для регистрации."
-    )
+def safe_edit(chat_id, message_id, text, reply_markup=None):
+    """Безопасное редактирование сообщения. Если не получается — отправляет новое."""
+    try:
+        bot.edit_message_text(
+            text, chat_id, message_id,
+            reply_markup=reply_markup,
+            parse_mode=None
+        )
+    except Exception:
+        # Сообщение нельзя отредактировать (старое или удалено) — отправляем новое
+        bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
-# ========== КЛАВИАТУРЫ ==========
+def cancel_button(callback_data="back_to_menu", text="❌ Отмена"):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(text, callback_data=callback_data))
+    return markup
 
-def main_menu(user_id: int):
+
+def back_button(callback="back_to_menu", text="◀️ В меню"):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(text, callback_data=callback))
+    return markup
+
+
+# ========== ГЛАВНОЕ МЕНЮ ==========
+
+def main_menu_markup(user_id: int):
     markup = InlineKeyboardMarkup(row_width=1)
     is_admin = db.is_admin(user_id)
 
@@ -71,97 +106,265 @@ def main_menu(user_id: int):
     return markup
 
 
-def back_button(callback="back_to_menu"):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("◀️ Назад в меню", callback_data=callback))
-    return markup
+def main_menu_text(user):
+    role_text = "👑 Администратор" if user["role"] == "admin" else "👤 Пользователь"
+    return (
+        f"🔧 Бот учёта инструментов\n\n"
+        f"👋 Привет, {user['full_name']}!\n"
+        f"Ваша роль: {role_text}\n\n"
+        f"Выберите действие или используйте /help"
+    )
 
 
-# ========== START ==========
+def show_main_menu_new_message(chat_id, user):
+    bot.send_message(
+        chat_id,
+        main_menu_text(user),
+        reply_markup=main_menu_markup(user["telegram_id"])
+    )
+
+
+# ========== КОМАНДЫ ==========
 
 @bot.message_handler(commands=['start', 'старт'])
-def start(message):
+def cmd_start(message):
     user_id = message.from_user.id
 
-    # Особая обработка для начального админа — авто-регистрация
     if INITIAL_ADMIN_ID and user_id == INITIAL_ADMIN_ID:
         if not db.is_registered(user_id):
             db.add_user(user_id, "Главный администратор", role="admin")
 
     if not check_access(user_id):
-        access_denied(message.chat.id)
+        bot.send_message(
+            message.chat.id,
+            "⛔ У вас нет доступа к этому боту.\n\n"
+            "Обратитесь к администратору для регистрации.\n"
+            f"Сообщите ему ваш Telegram ID: <code>{user_id}</code>",
+            parse_mode="HTML"
+        )
         return
 
+    clear_pending(user_id)
     user = db.get_user_by_telegram_id(user_id)
-    role_text = "👑 Администратор" if user["role"] == "admin" else "👤 Пользователь"
-    bot.send_message(
-        message.chat.id,
-        f"🔧 Бот учёта инструментов\n\n"
-        f"👋 Привет, {user['full_name']}!\n"
-        f"Ваша роль: {role_text}\n\n"
-        f"Выберите действие:",
-        reply_markup=main_menu(user_id)
+    show_main_menu_new_message(message.chat.id, user)
+
+
+@bot.message_handler(commands=['menu', 'меню'])
+def cmd_menu(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    clear_pending(user_id)
+    user = db.get_user_by_telegram_id(user_id)
+    show_main_menu_new_message(message.chat.id, user)
+
+
+@bot.message_handler(commands=['cancel', 'отмена'])
+def cmd_cancel(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    if get_pending(user_id):
+        clear_pending(user_id)
+        bot.send_message(message.chat.id, "❌ Действие отменено.\n/menu — вернуться в меню")
+    else:
+        bot.send_message(message.chat.id, "Нет активных действий. /menu — открыть меню")
+
+
+@bot.message_handler(commands=['help', 'помощь'])
+def cmd_help(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    is_adm = db.is_admin(user_id)
+    text = (
+        "📖 Доступные команды:\n\n"
+        "/start — начать работу\n"
+        "/menu — главное меню\n"
+        "/tools — все инструменты\n"
+        "/categories — список категорий\n"
+        "/stats — статистика\n"
+        "/cancel — отменить текущее действие\n"
+        "/help — эта справка"
     )
+    if is_adm:
+        text += (
+            "\n\nКоманды администратора:\n"
+            "/add — добавить инструмент\n"
+            "/users — управление пользователями\n"
+            "/cats — управление категориями"
+        )
+    bot.send_message(message.chat.id, text)
 
 
-# ========== ГЛАВНЫЙ CALLBACK HANDLER ==========
+@bot.message_handler(commands=['tools', 'инструменты'])
+def cmd_tools(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    clear_pending(user_id)
+    tools = db.get_all_tools()
+    if not tools:
+        bot.send_message(message.chat.id, "📭 Инструментов пока нет", reply_markup=back_button())
+        return
+    text = "📋 Все инструменты:\n\n"
+    for t in tools:
+        cat = t['category_name'] or "без категории"
+        owner = t['owner_name'] or "—"
+        text += f"🔧 {t['name']}\n   📂 {cat}\n   👤 {owner}\n\n"
+    bot.send_message(message.chat.id, text, reply_markup=back_button())
+
+
+@bot.message_handler(commands=['categories', 'категории'])
+def cmd_categories(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    clear_pending(user_id)
+    msg = bot.send_message(message.chat.id, "Загрузка...")
+    show_categories_view(message.chat.id, msg.message_id)
+
+
+@bot.message_handler(commands=['stats', 'статистика'])
+def cmd_stats(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    clear_pending(user_id)
+    stats = db.get_statistics()
+    text = (
+        f"📊 Статистика\n\n"
+        f"🔧 Активных инструментов: {stats['total_tools']}\n"
+        f"🗑 Списано: {stats['written_off']}\n"
+        f"🔄 Подтверждённых передач: {stats['transfers']}\n"
+        f"📂 Категорий: {stats['categories']}\n"
+        f"👥 Пользователей: {stats['users']}"
+    )
+    bot.send_message(message.chat.id, text, reply_markup=back_button())
+
+
+@bot.message_handler(commands=['add', 'добавить'])
+def cmd_add(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+    if not db.is_admin(user_id):
+        bot.send_message(message.chat.id, "⛔ Команда доступна только администраторам")
+        return
+    clear_pending(user_id)
+    msg = bot.send_message(message.chat.id, "Загрузка...")
+    start_add_tool_flow(message.chat.id, msg.message_id)
+
+
+@bot.message_handler(commands=['users', 'пользователи'])
+def cmd_users(message):
+    user_id = message.from_user.id
+    if not check_access(user_id) or not db.is_admin(user_id):
+        return
+    clear_pending(user_id)
+    msg = bot.send_message(message.chat.id, "Загрузка...")
+    show_manage_users(message.chat.id, msg.message_id)
+
+
+@bot.message_handler(commands=['cats'])
+def cmd_cats(message):
+    user_id = message.from_user.id
+    if not check_access(user_id) or not db.is_admin(user_id):
+        return
+    clear_pending(user_id)
+    msg = bot.send_message(message.chat.id, "Загрузка...")
+    show_manage_categories(message.chat.id, msg.message_id)
+
+
+# ========== ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def handle_text(message):
+    user_id = message.from_user.id
+    if not check_access(user_id):
+        return
+
+    pending = get_pending(user_id)
+    if not pending:
+        bot.send_message(
+            message.chat.id,
+            "Не понял запрос. Используйте команды:\n/menu — меню, /help — справка"
+        )
+        return
+
+    action = pending["action"]
+    data = pending["data"]
+    text = message.text.strip()
+
+    if action == "add_category_name":
+        process_add_category(message.chat.id, user_id, text)
+    elif action == "rename_category":
+        process_rename_category(message.chat.id, user_id, data["category_id"], text)
+    elif action == "add_user_id":
+        process_add_user_id(message.chat.id, user_id, text)
+    elif action == "add_user_name":
+        process_add_user_name(message.chat.id, user_id, data["telegram_id"], text)
+    elif action == "rename_user":
+        process_rename_user(message.chat.id, user_id, data["target_id"], text)
+    elif action == "add_tool_name":
+        process_add_tool_name(message.chat.id, user_id, data["category_id"], data["owner_id"], text)
+    elif action == "rename_tool":
+        process_rename_tool(message.chat.id, user_id, data["tool_id"], text)
+    elif action == "writeoff_custom_reason":
+        process_writeoff_custom_reason(message.chat.id, user_id, data["tool_id"], text)
+
+
+# ========== CALLBACK HANDLER ==========
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
 
-    # Проверка доступа на каждый callback
     if not check_access(user_id):
         bot.answer_callback_query(call.id, "⛔ Нет доступа", show_alert=True)
         return
 
     data = call.data
+    bot.answer_callback_query(call.id)
 
-    # ===== ГЛАВНОЕ МЕНЮ =====
     if data == "back_to_menu":
-        bot.edit_message_text(
-            "🔧 Главное меню:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=main_menu(user_id)
-        )
-        bot.answer_callback_query(call.id)
+        clear_pending(user_id)
+        user = db.get_user_by_telegram_id(user_id)
+        safe_edit(chat_id, msg_id, main_menu_text(user), main_menu_markup(user_id))
         return
 
-    # ===== КАТЕГОРИИ =====
     if data == "categories":
-        show_categories_menu(call)
+        show_categories_view(chat_id, msg_id)
         return
 
     if data.startswith("cat_view_"):
         category_id = int(data.replace("cat_view_", ""))
-        show_tools_in_category(call, category_id)
+        show_tools_in_category(chat_id, msg_id, category_id)
         return
 
-    # ===== СПИСОК ВСЕХ ИНСТРУМЕНТОВ =====
     if data == "list_all":
-        show_all_tools(call)
+        show_all_tools_view(chat_id, msg_id)
         return
 
-    # ===== СТАТИСТИКА =====
     if data == "stats":
-        show_stats(call)
+        show_stats_view(chat_id, msg_id)
         return
 
-    # ===== ИНСТРУМЕНТ — ДЕТАЛИ И ДЕЙСТВИЯ =====
     if data.startswith("tool_view_"):
         tool_id = int(data.replace("tool_view_", ""))
-        show_tool_details(call, tool_id)
+        show_tool_details(chat_id, msg_id, user_id, tool_id)
         return
 
     if data.startswith("tool_history_"):
         tool_id = int(data.replace("tool_history_", ""))
-        show_tool_history(call, tool_id)
+        show_tool_history(chat_id, msg_id, tool_id)
         return
 
     if data.startswith("tool_transfer_"):
         tool_id = int(data.replace("tool_transfer_", ""))
-        start_transfer(call, tool_id)
+        start_transfer(chat_id, msg_id, user_id, tool_id)
         return
 
     if data.startswith("tool_writeoff_"):
@@ -169,37 +372,53 @@ def callback_handler(call):
             bot.answer_callback_query(call.id, "⛔ Только админ", show_alert=True)
             return
         tool_id = int(data.replace("tool_writeoff_", ""))
-        ask_writeoff_reason(call, tool_id)
+        ask_writeoff_reason(chat_id, msg_id, tool_id)
         return
 
-    # ===== ДОБАВЛЕНИЕ ИНСТРУМЕНТА =====
+    if data.startswith("tool_rename_"):
+        if not db.is_admin(user_id):
+            return
+        tool_id = int(data.replace("tool_rename_", ""))
+        tool = db.get_tool_by_id(tool_id)
+        if tool:
+            set_pending(user_id, "rename_tool", {"tool_id": tool_id}, msg_id)
+            safe_edit(
+                chat_id, msg_id,
+                f"✏️ Переименование '{tool['name']}'\n\nВведите новое название:",
+                cancel_button(f"tool_view_{tool_id}")
+            )
+        return
+
     if data == "add_tool":
         if not db.is_admin(user_id):
             bot.answer_callback_query(call.id, "⛔ Только админ", show_alert=True)
             return
-        start_add_tool(call)
+        start_add_tool_flow(chat_id, msg_id)
         return
 
     if data.startswith("addtool_cat_"):
         category_id = int(data.replace("addtool_cat_", ""))
-        ask_tool_owner(call, category_id)
+        ask_tool_owner(chat_id, msg_id, category_id)
         return
 
     if data.startswith("addtool_owner_"):
-        # формат: addtool_owner_{cat_id}_{user_id}
         parts = data.replace("addtool_owner_", "").split("_")
         category_id = int(parts[0])
         owner_id = int(parts[1])
-        ask_tool_name(call, category_id, owner_id)
+        set_pending(user_id, "add_tool_name",
+                    {"category_id": category_id, "owner_id": owner_id}, msg_id)
+        safe_edit(
+            chat_id, msg_id,
+            "📝 Шаг 3/3: Введите название инструмента:",
+            cancel_button("back_to_menu")
+        )
         return
 
-    # ===== ПЕРЕДАЧА ИНСТРУМЕНТА =====
     if data.startswith("transfer_to_"):
-        # формат: transfer_to_{tool_id}_{user_id}
         parts = data.replace("transfer_to_", "").split("_")
         tool_id = int(parts[0])
         to_user_id = int(parts[1])
-        send_transfer_request(call, tool_id, to_user_id)
+        send_transfer_request(chat_id, msg_id, user_id, tool_id, to_user_id)
         return
 
     if data.startswith("confirm_tr_"):
@@ -212,29 +431,35 @@ def callback_handler(call):
         handle_transfer_reject(call, transfer_id)
         return
 
-    # ===== СПИСАНИЕ — ВЫБОР ПРИЧИНЫ =====
     if data.startswith("writeoff_reason_"):
-        # формат: writeoff_reason_{tool_id}_{reason_key}
         parts = data.replace("writeoff_reason_", "").split("_", 1)
         tool_id = int(parts[0])
         reason_key = parts[1]
-        process_writeoff(call, tool_id, reason_key)
+        process_writeoff(chat_id, msg_id, user_id, tool_id, reason_key)
         return
 
-    # ===== УПРАВЛЕНИЕ КАТЕГОРИЯМИ =====
+    if data.startswith("confirm_writeoff_"):
+        parts = data.replace("confirm_writeoff_", "").split("_", 1)
+        tool_id = int(parts[0])
+        reason_key = parts[1]
+        finalize_writeoff_simple(chat_id, msg_id, tool_id, reason_key)
+        return
+
     if data == "manage_cats":
         if not db.is_admin(user_id):
-            bot.answer_callback_query(call.id, "⛔ Только админ", show_alert=True)
             return
-        show_manage_categories(call)
+        show_manage_categories(chat_id, msg_id)
         return
 
     if data == "add_category":
         if not db.is_admin(user_id):
             return
-        msg = bot.send_message(call.message.chat.id, "📝 Введите название новой категории:")
-        bot.register_next_step_handler(msg, process_add_category)
-        bot.answer_callback_query(call.id)
+        set_pending(user_id, "add_category_name", {}, msg_id)
+        safe_edit(
+            chat_id, msg_id,
+            "📝 Введите название новой категории:",
+            cancel_button("manage_cats")
+        )
         return
 
     if data.startswith("cat_rename_"):
@@ -243,110 +468,161 @@ def callback_handler(call):
         category_id = int(data.replace("cat_rename_", ""))
         cat = db.get_category_by_id(category_id)
         if cat:
-            msg = bot.send_message(
-                call.message.chat.id,
-                f"✏️ Введите новое название для '{cat['name']}':"
+            set_pending(user_id, "rename_category", {"category_id": category_id}, msg_id)
+            safe_edit(
+                chat_id, msg_id,
+                f"✏️ Переименование категории '{cat['name']}'\n\nВведите новое название:",
+                cancel_button("manage_cats")
             )
-            bot.register_next_step_handler(msg, lambda m: process_rename_category(m, category_id))
-        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("cat_delete_confirm_"):
+        if not db.is_admin(user_id):
+            return
+        category_id = int(data.replace("cat_delete_confirm_", ""))
+        db.delete_category(category_id)
+        show_manage_categories(chat_id, msg_id, header="🗑 Категория удалена\n\n")
         return
 
     if data.startswith("cat_delete_"):
         if not db.is_admin(user_id):
             return
         category_id = int(data.replace("cat_delete_", ""))
-        if db.delete_category(category_id):
-            bot.answer_callback_query(call.id, "🗑 Категория удалена", show_alert=True)
-            show_manage_categories(call)
+        cat = db.get_category_by_id(category_id)
+        if cat:
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"cat_delete_confirm_{category_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data="manage_cats")
+            )
+            safe_edit(
+                chat_id, msg_id,
+                f"⚠️ Удалить категорию '{cat['name']}'?\n\n"
+                f"Инструменты не удалятся, но останутся без категории.",
+                markup
+            )
         return
 
-    # ===== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =====
     if data == "manage_users":
         if not db.is_admin(user_id):
-            bot.answer_callback_query(call.id, "⛔ Только админ", show_alert=True)
             return
-        show_manage_users(call)
+        show_manage_users(chat_id, msg_id)
         return
 
     if data == "add_user":
         if not db.is_admin(user_id):
             return
-        msg = bot.send_message(
-            call.message.chat.id,
-            "📝 Введите Telegram ID нового пользователя:\n"
-            "(Узнать свой ID можно у @userinfobot)"
+        set_pending(user_id, "add_user_id", {}, msg_id)
+        safe_edit(
+            chat_id, msg_id,
+            "📝 Шаг 1/2: Введите Telegram ID нового пользователя\n\n"
+            "(узнать ID можно у @userinfobot)",
+            cancel_button("manage_users")
         )
-        bot.register_next_step_handler(msg, process_add_user_id)
-        bot.answer_callback_query(call.id)
         return
 
     if data.startswith("user_view_"):
         if not db.is_admin(user_id):
             return
         target_id = int(data.replace("user_view_", ""))
-        show_user_details(call, target_id)
+        show_user_details(chat_id, msg_id, target_id)
         return
 
     if data.startswith("user_rename_"):
         if not db.is_admin(user_id):
             return
         target_id = int(data.replace("user_rename_", ""))
-        msg = bot.send_message(call.message.chat.id, "✏️ Введите новое имя:")
-        bot.register_next_step_handler(msg, lambda m: process_rename_user(m, target_id))
-        bot.answer_callback_query(call.id)
+        user = db.get_user_by_id(target_id)
+        if user:
+            set_pending(user_id, "rename_user", {"target_id": target_id}, msg_id)
+            safe_edit(
+                chat_id, msg_id,
+                f"✏️ Переименование '{user['full_name']}'\n\nВведите новое имя:",
+                cancel_button(f"user_view_{target_id}")
+            )
+        return
+
+    if data.startswith("user_role_confirm_"):
+        if not db.is_admin(user_id):
+            return
+        target_id = int(data.replace("user_role_confirm_", ""))
+        user = db.get_user_by_id(target_id)
+        if user:
+            new_role = "user" if user['role'] == "admin" else "admin"
+            db.update_user(target_id, role=new_role)
+        show_user_details(chat_id, msg_id, target_id)
         return
 
     if data.startswith("user_role_"):
         if not db.is_admin(user_id):
             return
         target_id = int(data.replace("user_role_", ""))
-        toggle_user_role(call, target_id)
+        user = db.get_user_by_id(target_id)
+        if user:
+            new_role = "user" if user['role'] == "admin" else "admin"
+            new_role_label = "пользователем" if new_role == "user" else "администратором"
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("✅ Да", callback_data=f"user_role_confirm_{target_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"user_view_{target_id}")
+            )
+            safe_edit(
+                chat_id, msg_id,
+                f"⚠️ Сделать '{user['full_name']}' {new_role_label}?",
+                markup
+            )
+        return
+
+    if data.startswith("user_delete_confirm_"):
+        if not db.is_admin(user_id):
+            return
+        target_id = int(data.replace("user_delete_confirm_", ""))
+        db.soft_delete_user(target_id)
+        show_manage_users(chat_id, msg_id, header="🗑 Пользователь удалён\n\n")
         return
 
     if data.startswith("user_delete_"):
         if not db.is_admin(user_id):
             return
         target_id = int(data.replace("user_delete_", ""))
-        db.soft_delete_user(target_id)
-        bot.answer_callback_query(call.id, "🗑 Пользователь удалён", show_alert=True)
-        show_manage_users(call)
+        user = db.get_user_by_id(target_id)
+        if user:
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"user_delete_confirm_{target_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"user_view_{target_id}")
+            )
+            safe_edit(
+                chat_id, msg_id,
+                f"⚠️ Удалить пользователя '{user['full_name']}'?\n\n"
+                f"История его действий сохранится.",
+                markup
+            )
         return
 
 
-# ========== ОТОБРАЖЕНИЕ — КАТЕГОРИИ ==========
+# ========== ВЬЮХИ — КАТЕГОРИИ ==========
 
-def show_categories_menu(call):
+def show_categories_view(chat_id, msg_id):
     cats = db.get_all_categories()
-    if not cats:
-        bot.edit_message_text(
-            "📭 Категорий пока нет.\n\nПопросите администратора создать категорию.",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=back_button()
-        )
-        bot.answer_callback_query(call.id)
-        return
-
     markup = InlineKeyboardMarkup(row_width=1)
-    for cat in cats:
-        markup.add(InlineKeyboardButton(
-            f"📂 {cat['name']} ({cat['tools_count']})",
-            callback_data=f"cat_view_{cat['id']}"
-        ))
-    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu"))
-    bot.edit_message_text(
-        "📂 Выберите категорию:",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=markup
-    )
-    bot.answer_callback_query(call.id)
+    if not cats:
+        text = "📭 Категорий пока нет.\n\nПопросите администратора создать категорию."
+    else:
+        text = "📂 Выберите категорию:"
+        for cat in cats:
+            markup.add(InlineKeyboardButton(
+                f"📂 {cat['name']} ({cat['tools_count']})",
+                callback_data=f"cat_view_{cat['id']}"
+            ))
+    markup.add(InlineKeyboardButton("◀️ В меню", callback_data="back_to_menu"))
+    safe_edit(chat_id, msg_id, text, markup)
 
 
-def show_tools_in_category(call, category_id: int):
+def show_tools_in_category(chat_id, msg_id, category_id: int):
     cat = db.get_category_by_id(category_id)
     if not cat:
-        bot.answer_callback_query(call.id, "❌ Категория не найдена", show_alert=True)
+        safe_edit(chat_id, msg_id, "❌ Категория не найдена", back_button())
         return
     tools = db.get_tools_by_category(category_id)
     markup = InlineKeyboardMarkup(row_width=1)
@@ -361,38 +637,42 @@ def show_tools_in_category(call, category_id: int):
                 callback_data=f"tool_view_{t['id']}"
             ))
     markup.add(InlineKeyboardButton("◀️ К категориям", callback_data="categories"))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    markup.add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_menu"))
+    safe_edit(chat_id, msg_id, text, markup)
 
 
-def show_all_tools(call):
+def show_all_tools_view(chat_id, msg_id):
     tools = db.get_all_tools()
     if not tools:
-        bot.edit_message_text(
-            "📭 Инструментов пока нет",
-            call.message.chat.id, call.message.message_id,
-            reply_markup=back_button()
-        )
-        bot.answer_callback_query(call.id)
+        safe_edit(chat_id, msg_id, "📭 Инструментов пока нет", back_button())
         return
     text = "📋 Все инструменты:\n\n"
     for t in tools:
         cat = t['category_name'] or "без категории"
         owner = t['owner_name'] or "—"
         text += f"🔧 {t['name']}\n   📂 {cat}\n   👤 {owner}\n\n"
-    bot.edit_message_text(
-        text, call.message.chat.id, call.message.message_id,
-        reply_markup=back_button()
+    safe_edit(chat_id, msg_id, text, back_button())
+
+
+def show_stats_view(chat_id, msg_id):
+    stats = db.get_statistics()
+    text = (
+        f"📊 Статистика\n\n"
+        f"🔧 Активных инструментов: {stats['total_tools']}\n"
+        f"🗑 Списано: {stats['written_off']}\n"
+        f"🔄 Подтверждённых передач: {stats['transfers']}\n"
+        f"📂 Категорий: {stats['categories']}\n"
+        f"👥 Пользователей: {stats['users']}"
     )
-    bot.answer_callback_query(call.id)
+    safe_edit(chat_id, msg_id, text, back_button())
 
 
-# ========== ОТОБРАЖЕНИЕ — ИНСТРУМЕНТ ==========
+# ========== ВЬЮХИ — ИНСТРУМЕНТ ==========
 
-def show_tool_details(call, tool_id: int):
+def show_tool_details(chat_id, msg_id, viewer_id: int, tool_id: int):
     tool = db.get_tool_by_id(tool_id)
     if not tool:
-        bot.answer_callback_query(call.id, "❌ Инструмент не найден", show_alert=True)
+        safe_edit(chat_id, msg_id, "❌ Инструмент не найден", back_button())
         return
     cat = tool['category_name'] or "без категории"
     owner = tool['owner_name'] or "—"
@@ -402,22 +682,24 @@ def show_tool_details(call, tool_id: int):
         text += f"\n📝 Причина: {tool['write_off_reason']}"
 
     markup = InlineKeyboardMarkup(row_width=1)
+    is_adm = db.is_admin(viewer_id)
     if tool['status'] == 'active':
         markup.add(InlineKeyboardButton("🔄 Передать", callback_data=f"tool_transfer_{tool_id}"))
     markup.add(InlineKeyboardButton("📜 История", callback_data=f"tool_history_{tool_id}"))
-    if db.is_admin(call.from_user.id) and tool['status'] == 'active':
+    if is_adm and tool['status'] == 'active':
+        markup.add(InlineKeyboardButton("✏️ Переименовать", callback_data=f"tool_rename_{tool_id}"))
         markup.add(InlineKeyboardButton("🗑 Списать", callback_data=f"tool_writeoff_{tool_id}"))
     if tool['category_id']:
         markup.add(InlineKeyboardButton("◀️ К категории", callback_data=f"cat_view_{tool['category_id']}"))
-    markup.add(InlineKeyboardButton("◀️ В меню", callback_data="back_to_menu"))
+    markup.add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_menu"))
 
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    safe_edit(chat_id, msg_id, text, markup)
 
 
-def show_tool_history(call, tool_id: int):
+def show_tool_history(chat_id, msg_id, tool_id: int):
     tool = db.get_tool_by_id(tool_id)
     if not tool:
+        safe_edit(chat_id, msg_id, "❌ Инструмент не найден", back_button())
         return
     history = db.get_tool_history(tool_id, limit=10)
     text = f"📜 История '{tool['name']}'\n\n"
@@ -440,19 +722,19 @@ def show_tool_history(call, tool_id: int):
                 text += f"✏️ {dt}\n   {h['note']}\n\n"
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("◀️ Назад", callback_data=f"tool_view_{tool_id}"))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    markup.add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_menu"))
+    safe_edit(chat_id, msg_id, text, markup)
 
 
 # ========== ДОБАВЛЕНИЕ ИНСТРУМЕНТА ==========
 
-def start_add_tool(call):
+def start_add_tool_flow(chat_id, msg_id):
     cats = db.get_all_categories()
     if not cats:
-        bot.answer_callback_query(
-            call.id,
+        safe_edit(
+            chat_id, msg_id,
             "❌ Сначала создайте хотя бы одну категорию",
-            show_alert=True
+            back_button("manage_cats", "🗂 К категориям")
         )
         return
     markup = InlineKeyboardMarkup(row_width=1)
@@ -460,19 +742,21 @@ def start_add_tool(call):
         markup.add(InlineKeyboardButton(
             f"📂 {cat['name']}", callback_data=f"addtool_cat_{cat['id']}"
         ))
-    markup.add(InlineKeyboardButton("◀️ Отмена", callback_data="back_to_menu"))
-    bot.edit_message_text(
+    markup.add(InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu"))
+    safe_edit(
+        chat_id, msg_id,
         "📂 Шаг 1/3: Выберите категорию для нового инструмента:",
-        call.message.chat.id, call.message.message_id, reply_markup=markup
+        markup
     )
-    bot.answer_callback_query(call.id)
 
 
-def ask_tool_owner(call, category_id: int):
+def ask_tool_owner(chat_id, msg_id, category_id: int):
     users = db.get_all_users()
     if not users:
-        bot.answer_callback_query(
-            call.id, "❌ Нет зарегистрированных пользователей", show_alert=True
+        safe_edit(
+            chat_id, msg_id,
+            "❌ Нет зарегистрированных пользователей",
+            back_button()
         )
         return
     markup = InlineKeyboardMarkup(row_width=1)
@@ -481,55 +765,70 @@ def ask_tool_owner(call, category_id: int):
             f"👤 {u['full_name']}",
             callback_data=f"addtool_owner_{category_id}_{u['id']}"
         ))
-    markup.add(InlineKeyboardButton("◀️ Отмена", callback_data="back_to_menu"))
-    bot.edit_message_text(
+    markup.add(InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu"))
+    safe_edit(
+        chat_id, msg_id,
         "👤 Шаг 2/3: За кем закрепить инструмент?",
-        call.message.chat.id, call.message.message_id, reply_markup=markup
+        markup
     )
-    bot.answer_callback_query(call.id)
 
 
-def ask_tool_name(call, category_id: int, owner_id: int):
-    msg = bot.send_message(
-        call.message.chat.id,
-        "📝 Шаг 3/3: Введите название инструмента:"
-    )
-    bot.register_next_step_handler(msg, lambda m: process_tool_name(m, category_id, owner_id))
-    bot.answer_callback_query(call.id)
+def process_add_tool_name(chat_id, user_id, category_id: int, owner_id: int, name: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
 
-
-def process_tool_name(message, category_id: int, owner_id: int):
-    name = message.text.strip()
     if not name:
-        bot.send_message(message.chat.id, "❌ Название не может быть пустым")
-        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Название не может быть пустым", back_button())
         return
+
     tool = db.add_tool(name, category_id, owner_id)
-    bot.send_message(message.chat.id, f"✅ Инструмент '{tool['name']}' добавлен!")
-    bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton(f"🔧 Открыть '{tool['name']}'", callback_data=f"tool_view_{tool['id']}"))
+    markup.add(InlineKeyboardButton("➕ Добавить ещё", callback_data="add_tool"))
+    markup.add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_menu"))
+
+    if msg_id:
+        safe_edit(chat_id, msg_id, f"✅ Инструмент '{tool['name']}' добавлен!", markup)
+    else:
+        bot.send_message(chat_id, f"✅ Инструмент '{tool['name']}' добавлен!", reply_markup=markup)
 
 
-# ========== ПЕРЕДАЧА ИНСТРУМЕНТА ==========
+def process_rename_tool(chat_id, user_id, tool_id: int, new_name: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
 
-def start_transfer(call, tool_id: int):
+    if not new_name:
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Название не может быть пустым", back_button())
+        return
+
+    if db.rename_tool(tool_id, new_name):
+        if msg_id:
+            show_tool_details(chat_id, msg_id, user_id, tool_id)
+        else:
+            bot.send_message(chat_id, f"✅ Переименован в '{new_name}'", reply_markup=back_button())
+
+
+# ========== ПЕРЕДАЧА ==========
+
+def start_transfer(chat_id, msg_id, user_id: int, tool_id: int):
     tool = db.get_tool_by_id(tool_id)
     if not tool or tool['status'] != 'active':
-        bot.answer_callback_query(call.id, "❌ Инструмент недоступен", show_alert=True)
+        safe_edit(chat_id, msg_id, "❌ Инструмент недоступен", back_button())
         return
-    # право на передачу: текущий владелец или админ
-    user = db.get_user_by_telegram_id(call.from_user.id)
+    user = db.get_user_by_telegram_id(user_id)
     if user['role'] != 'admin' and tool['current_owner_id'] != user['id']:
-        bot.answer_callback_query(
-            call.id, "⛔ Передавать может только текущий владелец или админ",
-            show_alert=True
-        )
+        bot.send_message(chat_id, "⛔ Передавать может только текущий владелец или админ")
         return
 
     users = db.get_all_users()
-    # исключаем текущего владельца
     users = [u for u in users if u['id'] != tool['current_owner_id']]
     if not users:
-        bot.answer_callback_query(call.id, "❌ Некому передать", show_alert=True)
+        safe_edit(chat_id, msg_id, "❌ Некому передать", back_button(f"tool_view_{tool_id}", "◀️ Назад"))
         return
 
     markup = InlineKeyboardMarkup(row_width=1)
@@ -538,26 +837,25 @@ def start_transfer(call, tool_id: int):
             f"👤 {u['full_name']}",
             callback_data=f"transfer_to_{tool_id}_{u['id']}"
         ))
-    markup.add(InlineKeyboardButton("◀️ Отмена", callback_data=f"tool_view_{tool_id}"))
-    bot.edit_message_text(
+    markup.add(InlineKeyboardButton("❌ Отмена", callback_data=f"tool_view_{tool_id}"))
+    safe_edit(
+        chat_id, msg_id,
         f"🔄 Передать '{tool['name']}'\n\nКому передаёте?",
-        call.message.chat.id, call.message.message_id, reply_markup=markup
+        markup
     )
-    bot.answer_callback_query(call.id)
 
 
-def send_transfer_request(call, tool_id: int, to_user_id: int):
+def send_transfer_request(chat_id, msg_id, user_id, tool_id: int, to_user_id: int):
     tool = db.get_tool_by_id(tool_id)
     to_user = db.get_user_by_id(to_user_id)
-    from_user = db.get_user_by_telegram_id(call.from_user.id)
+    from_user = db.get_user_by_telegram_id(user_id)
 
     if not tool or not to_user or not from_user:
-        bot.answer_callback_query(call.id, "❌ Ошибка", show_alert=True)
+        safe_edit(chat_id, msg_id, "❌ Ошибка", back_button())
         return
 
     transfer = db.create_transfer_request(tool_id, from_user['id'], to_user_id)
 
-    # уведомление получателю
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_tr_{transfer['id']}"),
@@ -573,46 +871,44 @@ def send_transfer_request(call, tool_id: int, to_user_id: int):
             f"Подтверждаете получение?",
             reply_markup=markup
         )
-    except Exception as e:
-        bot.answer_callback_query(
-            call.id,
+    except Exception:
+        safe_edit(
+            chat_id, msg_id,
             f"⚠️ Не удалось отправить уведомление получателю.\n"
             f"Возможно, он не запускал бота командой /start",
-            show_alert=True
+            back_button(f"tool_view_{tool_id}", "◀️ Назад")
         )
         return
 
-    bot.edit_message_text(
+    safe_edit(
+        chat_id, msg_id,
         f"⏳ Запрос на передачу '{tool['name']}' отправлен пользователю {to_user['full_name']}.\n"
         f"Ожидаем подтверждения.",
-        call.message.chat.id, call.message.message_id,
-        reply_markup=back_button()
+        back_button()
     )
-    bot.answer_callback_query(call.id, "✅ Запрос отправлен")
 
 
 def handle_transfer_confirm(call, transfer_id: int):
     transfer = db.get_transfer_by_id(transfer_id)
     if not transfer:
-        bot.answer_callback_query(call.id, "❌ Передача не найдена", show_alert=True)
+        safe_edit(call.message.chat.id, call.message.message_id,
+                  "❌ Передача не найдена", back_button())
         return
-    # проверка что подтверждает именно получатель
     if transfer['to_telegram_id'] != call.from_user.id:
         bot.answer_callback_query(call.id, "⛔ Подтвердить может только получатель", show_alert=True)
         return
     if transfer['status'] != 'pending':
-        bot.answer_callback_query(call.id, "⚠️ Запрос уже обработан", show_alert=True)
+        safe_edit(call.message.chat.id, call.message.message_id,
+                  "⚠️ Запрос уже обработан", back_button())
         return
 
     db.confirm_transfer(transfer_id)
-
-    bot.edit_message_text(
+    safe_edit(
+        call.message.chat.id, call.message.message_id,
         f"✅ Вы подтвердили получение '{transfer['tool_name']}'.\n"
         f"Инструмент закреплён за вами.",
-        call.message.chat.id, call.message.message_id
+        back_button()
     )
-
-    # уведомление отправителю
     try:
         bot.send_message(
             transfer['from_telegram_id'],
@@ -620,8 +916,6 @@ def handle_transfer_confirm(call, transfer_id: int):
         )
     except Exception:
         pass
-
-    bot.answer_callback_query(call.id)
 
 
 def handle_transfer_reject(call, transfer_id: int):
@@ -632,17 +926,17 @@ def handle_transfer_reject(call, transfer_id: int):
         bot.answer_callback_query(call.id, "⛔ Только получатель может отказать", show_alert=True)
         return
     if transfer['status'] != 'pending':
-        bot.answer_callback_query(call.id, "⚠️ Запрос уже обработан", show_alert=True)
+        safe_edit(call.message.chat.id, call.message.message_id,
+                  "⚠️ Запрос уже обработан", back_button())
         return
 
     db.reject_transfer(transfer_id)
-
-    bot.edit_message_text(
+    safe_edit(
+        call.message.chat.id, call.message.message_id,
         f"❌ Вы отказались от инструмента '{transfer['tool_name']}'.\n"
         f"Инструмент остался у прежнего владельца.",
-        call.message.chat.id, call.message.message_id
+        back_button()
     )
-
     try:
         bot.send_message(
             transfer['from_telegram_id'],
@@ -650,8 +944,6 @@ def handle_transfer_reject(call, transfer_id: int):
         )
     except Exception:
         pass
-
-    bot.answer_callback_query(call.id)
 
 
 # ========== СПИСАНИЕ ==========
@@ -666,7 +958,7 @@ WRITEOFF_REASONS = {
 }
 
 
-def ask_writeoff_reason(call, tool_id: int):
+def ask_writeoff_reason(chat_id, msg_id, tool_id: int):
     tool = db.get_tool_by_id(tool_id)
     if not tool:
         return
@@ -675,97 +967,127 @@ def ask_writeoff_reason(call, tool_id: int):
         markup.add(InlineKeyboardButton(
             label, callback_data=f"writeoff_reason_{tool_id}_{key}"
         ))
-    markup.add(InlineKeyboardButton("◀️ Отмена", callback_data=f"tool_view_{tool_id}"))
-    bot.edit_message_text(
+    markup.add(InlineKeyboardButton("❌ Отмена", callback_data=f"tool_view_{tool_id}"))
+    safe_edit(
+        chat_id, msg_id,
         f"🗑 Списание '{tool['name']}'\n\nВыберите причину:",
-        call.message.chat.id, call.message.message_id, reply_markup=markup
+        markup
     )
-    bot.answer_callback_query(call.id)
 
 
-def process_writeoff(call, tool_id: int, reason_key: str):
+def process_writeoff(chat_id, msg_id, user_id, tool_id: int, reason_key: str):
     if reason_key == "other":
-        msg = bot.send_message(
-            call.message.chat.id,
-            "📝 Введите свою причину списания:"
+        set_pending(user_id, "writeoff_custom_reason", {"tool_id": tool_id}, msg_id)
+        safe_edit(
+            chat_id, msg_id,
+            "📝 Введите причину списания:",
+            cancel_button(f"tool_view_{tool_id}")
         )
-        bot.register_next_step_handler(msg, lambda m: finalize_writeoff(m, tool_id, m.text.strip()))
-        bot.answer_callback_query(call.id)
         return
 
+    tool = db.get_tool_by_id(tool_id)
+    reason = WRITEOFF_REASONS.get(reason_key, "не указана")
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("✅ Да, списать", callback_data=f"confirm_writeoff_{tool_id}_{reason_key}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"tool_view_{tool_id}")
+    )
+    safe_edit(
+        chat_id, msg_id,
+        f"⚠️ Подтвердите списание\n\n🔧 {tool['name']}\n📝 Причина: {reason}",
+        markup
+    )
+
+
+def finalize_writeoff_simple(chat_id, msg_id, tool_id: int, reason_key: str):
     reason = WRITEOFF_REASONS.get(reason_key, "не указана")
     if db.write_off_tool(tool_id, reason):
         tool = db.get_tool_by_id(tool_id)
-        bot.edit_message_text(
+        safe_edit(
+            chat_id, msg_id,
             f"🗑 '{tool['name']}' списан\nПричина: {reason}",
-            call.message.chat.id, call.message.message_id,
-            reply_markup=back_button()
+            back_button()
         )
-    bot.answer_callback_query(call.id)
 
 
-def finalize_writeoff(message, tool_id: int, reason: str):
+def process_writeoff_custom_reason(chat_id, user_id, tool_id: int, reason: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
+
     if not reason:
-        bot.send_message(message.chat.id, "❌ Причина не может быть пустой")
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Причина не может быть пустой", back_button())
         return
+
     if db.write_off_tool(tool_id, reason):
         tool = db.get_tool_by_id(tool_id)
-        bot.send_message(message.chat.id, f"🗑 '{tool['name']}' списан\nПричина: {reason}")
-    bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        text = f"🗑 '{tool['name']}' списан\nПричина: {reason}"
+        if msg_id:
+            safe_edit(chat_id, msg_id, text, back_button())
+        else:
+            bot.send_message(chat_id, text, reply_markup=back_button())
 
 
 # ========== УПРАВЛЕНИЕ КАТЕГОРИЯМИ ==========
 
-def show_manage_categories(call):
+def show_manage_categories(chat_id, msg_id, header: str = ""):
     cats = db.get_all_categories()
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(InlineKeyboardButton("➕ Добавить категорию", callback_data="add_category"))
     for cat in cats:
-        markup.add(
-            InlineKeyboardButton(
-                f"✏️ {cat['name']} ({cat['tools_count']})",
-                callback_data=f"cat_rename_{cat['id']}"
-            )
-        )
-        markup.add(
-            InlineKeyboardButton(
-                f"🗑 Удалить '{cat['name']}'",
-                callback_data=f"cat_delete_{cat['id']}"
-            )
-        )
-    markup.add(InlineKeyboardButton("◀️ В меню", callback_data="back_to_menu"))
-    text = "🗂 Управление категориями\n\nДля переименования нажмите ✏️"
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+        markup.add(InlineKeyboardButton(
+            f"✏️ {cat['name']} ({cat['tools_count']})",
+            callback_data=f"cat_rename_{cat['id']}"
+        ))
+        markup.add(InlineKeyboardButton(
+            f"🗑 Удалить '{cat['name']}'",
+            callback_data=f"cat_delete_{cat['id']}"
+        ))
+    markup.add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_menu"))
+    text = header + "🗂 Управление категориями\n\nДля переименования нажмите ✏️"
+    safe_edit(chat_id, msg_id, text, markup)
 
 
-def process_add_category(message):
-    if not db.is_admin(message.from_user.id):
-        return
-    name = message.text.strip()
+def process_add_category(chat_id, user_id, name: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
+
     if not name:
-        bot.send_message(message.chat.id, "❌ Название не может быть пустым")
-    elif db.add_category(name):
-        bot.send_message(message.chat.id, f"✅ Категория '{name}' создана!")
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Название не может быть пустым", back_button())
+        return
+
+    cat = db.add_category(name)
+    if cat:
+        if msg_id:
+            show_manage_categories(chat_id, msg_id, header=f"✅ Категория '{name}' создана\n\n")
+        else:
+            bot.send_message(chat_id, f"✅ Категория '{name}' создана!", reply_markup=back_button())
     else:
-        bot.send_message(message.chat.id, f"⚠️ Категория '{name}' уже существует")
-    bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        if msg_id:
+            safe_edit(chat_id, msg_id, f"⚠️ Категория '{name}' уже существует", back_button("manage_cats"))
 
 
-def process_rename_category(message, category_id: int):
-    new_name = message.text.strip()
+def process_rename_category(chat_id, user_id, category_id: int, new_name: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
+
     if not new_name:
-        bot.send_message(message.chat.id, "❌ Название не может быть пустым")
-    elif db.rename_category(category_id, new_name):
-        bot.send_message(message.chat.id, f"✅ Категория переименована в '{new_name}'")
-    else:
-        bot.send_message(message.chat.id, "❌ Не удалось переименовать")
-    bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Название не может быть пустым", back_button("manage_cats"))
+        return
+
+    if db.rename_category(category_id, new_name):
+        if msg_id:
+            show_manage_categories(chat_id, msg_id, header=f"✅ Переименовано в '{new_name}'\n\n")
 
 
 # ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==========
 
-def show_manage_users(call):
+def show_manage_users(chat_id, msg_id, header: str = ""):
     users = db.get_all_users()
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(InlineKeyboardButton("➕ Добавить пользователя", callback_data="add_user"))
@@ -775,17 +1097,14 @@ def show_manage_users(call):
             f"{role_icon} {u['full_name']}",
             callback_data=f"user_view_{u['id']}"
         ))
-    markup.add(InlineKeyboardButton("◀️ В меню", callback_data="back_to_menu"))
-    bot.edit_message_text(
-        "👥 Пользователи системы:",
-        call.message.chat.id, call.message.message_id, reply_markup=markup
-    )
-    bot.answer_callback_query(call.id)
+    markup.add(InlineKeyboardButton("🏠 В меню", callback_data="back_to_menu"))
+    safe_edit(chat_id, msg_id, header + "👥 Пользователи системы:", markup)
 
 
-def show_user_details(call, target_id: int):
+def show_user_details(chat_id, msg_id, target_id: int):
     user = db.get_user_by_id(target_id)
     if not user:
+        safe_edit(chat_id, msg_id, "❌ Пользователь не найден", back_button())
         return
     role = "👑 Администратор" if user['role'] == 'admin' else "👤 Пользователь"
     text = (
@@ -799,87 +1118,65 @@ def show_user_details(call, target_id: int):
     markup.add(InlineKeyboardButton(f"🔄 {new_role_label}", callback_data=f"user_role_{target_id}"))
     markup.add(InlineKeyboardButton("🗑 Удалить", callback_data=f"user_delete_{target_id}"))
     markup.add(InlineKeyboardButton("◀️ К списку", callback_data="manage_users"))
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
+    safe_edit(chat_id, msg_id, text, markup)
 
 
-# ВРЕМЕННОЕ ХРАНИЛИЩЕ для процесса добавления пользователя (telegram_id → ожидаем ввод имени)
-_pending_user_ids = {}
+def process_add_user_id(chat_id, user_id, text: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
 
-
-def process_add_user_id(message):
-    if not db.is_admin(message.from_user.id):
-        return
     try:
-        new_tg_id = int(message.text.strip())
+        new_tg_id = int(text)
     except ValueError:
-        bot.send_message(message.chat.id, "❌ Telegram ID должен быть числом")
-        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+        if msg_id:
+            safe_edit(
+                chat_id, msg_id,
+                "❌ Telegram ID должен быть числом\n\nПопробуйте ещё раз:",
+                cancel_button("manage_users")
+            )
         return
-    _pending_user_ids[message.from_user.id] = new_tg_id
-    msg = bot.send_message(
-        message.chat.id,
-        "📝 Введите имя пользователя (например: Иванов Иван):"
-    )
-    bot.register_next_step_handler(msg, process_add_user_name)
+
+    set_pending(user_id, "add_user_name", {"telegram_id": new_tg_id}, msg_id)
+    if msg_id:
+        safe_edit(
+            chat_id, msg_id,
+            f"📝 Шаг 2/2: Введите имя пользователя\n\nID: {new_tg_id}\n\n(например: Иванов Иван)",
+            cancel_button("manage_users")
+        )
 
 
-def process_add_user_name(message):
-    if not db.is_admin(message.from_user.id):
+def process_add_user_name(chat_id, user_id, telegram_id: int, full_name: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
+
+    if not full_name:
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Имя не может быть пустым", back_button("manage_users"))
         return
-    full_name = message.text.strip()
-    new_tg_id = _pending_user_ids.pop(message.from_user.id, None)
-    if not new_tg_id or not full_name:
-        bot.send_message(message.chat.id, "❌ Ошибка ввода")
-        bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
-        return
-    db.add_user(new_tg_id, full_name, role="user")
-    bot.send_message(
-        message.chat.id,
+
+    db.add_user(telegram_id, full_name, role="user")
+    text = (
         f"✅ Пользователь '{full_name}' добавлен!\n"
         f"Попросите его запустить бота командой /start"
     )
-    bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
+    if msg_id:
+        show_manage_users(chat_id, msg_id, header=text + "\n\n")
 
 
-def process_rename_user(message, target_id: int):
-    if not db.is_admin(message.from_user.id):
+def process_rename_user(chat_id, user_id, target_id: int, new_name: str):
+    pending = get_pending(user_id)
+    msg_id = pending["msg_id"] if pending else None
+    clear_pending(user_id)
+
+    if not new_name:
+        if msg_id:
+            safe_edit(chat_id, msg_id, "❌ Имя не может быть пустым", back_button())
         return
-    new_name = message.text.strip()
-    if new_name and db.update_user(target_id, full_name=new_name):
-        bot.send_message(message.chat.id, f"✅ Имя изменено на '{new_name}'")
-    else:
-        bot.send_message(message.chat.id, "❌ Не удалось переименовать")
-    bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu(message.from_user.id))
 
-
-def toggle_user_role(call, target_id: int):
-    user = db.get_user_by_id(target_id)
-    if not user:
-        return
-    new_role = "user" if user['role'] == "admin" else "admin"
-    db.update_user(target_id, role=new_role)
-    bot.answer_callback_query(call.id, f"✅ Роль изменена на: {new_role}", show_alert=True)
-    show_user_details(call, target_id)
-
-
-# ========== СТАТИСТИКА ==========
-
-def show_stats(call):
-    stats = db.get_statistics()
-    text = (
-        f"📊 Статистика\n\n"
-        f"🔧 Активных инструментов: {stats['total_tools']}\n"
-        f"🗑 Списано: {stats['written_off']}\n"
-        f"🔄 Подтверждённых передач: {stats['transfers']}\n"
-        f"📂 Категорий: {stats['categories']}\n"
-        f"👥 Пользователей: {stats['users']}"
-    )
-    bot.edit_message_text(
-        text, call.message.chat.id, call.message.message_id,
-        reply_markup=back_button()
-    )
-    bot.answer_callback_query(call.id)
+    if db.update_user(target_id, full_name=new_name):
+        if msg_id:
+            show_user_details(chat_id, msg_id, target_id)
 
 
 # ========== FLASK ДЛЯ RAILWAY ==========
@@ -897,11 +1194,35 @@ def run_bot():
     bot.infinity_polling()
 
 
+# ========== УСТАНОВКА КОМАНД В МЕНЮ TELEGRAM ==========
+
+def setup_bot_commands():
+    """Регистрирует команды чтобы они отображались в меню Telegram (синяя кнопка / )."""
+    from telebot.types import BotCommand
+    commands = [
+        BotCommand("menu", "Главное меню"),
+        BotCommand("tools", "Все инструменты"),
+        BotCommand("categories", "Категории"),
+        BotCommand("stats", "Статистика"),
+        BotCommand("add", "Добавить инструмент (админ)"),
+        BotCommand("users", "Пользователи (админ)"),
+        BotCommand("cats", "Категории — управление (админ)"),
+        BotCommand("cancel", "Отменить текущее действие"),
+        BotCommand("help", "Справка"),
+    ]
+    try:
+        bot.set_my_commands(commands)
+        print("✅ Команды зарегистрированы в меню Telegram")
+    except Exception as e:
+        print(f"⚠️ Не удалось зарегистрировать команды: {e}")
+
+
 # ========== ЗАПУСК ==========
 
 if __name__ == "__main__":
     db.init_db()
     ensure_initial_admin()
+    setup_bot_commands()
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
